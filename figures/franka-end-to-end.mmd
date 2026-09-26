@@ -1,0 +1,35 @@
+flowchart LR
+    subgraph demonstrate["1 · Demonstrate"]
+        direction TB
+        gello["GELLO / VR"]
+        cameras["Dual RGB cameras"]
+        collector["Collection workstation<br/>20 Hz episodes"]
+        gello --> collector
+        cameras --> collector
+    end
+
+    subgraph learn["2 · Curate and learn"]
+        direction TB
+        raw["Raw episodes"] --> qa["Convert + audit"] --> dataset["LeRobot v2.1"]
+        dataset --> train["Policy training"] --> server["Loopback<br/>policy server"]
+    end
+
+    subgraph deploy["3 · Deploy"]
+        direction TB
+        client["Policy client<br/>shadow to armed"] --> nuc["RT NUC<br/>1 kHz FCI"] --> robot["Franka robot"]
+    end
+
+    demonstrate -->|"episodes"| learn
+    learn -->|"SSH tunnel"| deploy
+    demonstrate -.->|"teleop targets"| deploy
+
+    class gello,cameras input
+    class collector,raw,qa,dataset data
+    class train,server model
+    class client,nuc,robot control
+
+    classDef input fill:#ECFDF5,stroke:#10B981,color:#111827,stroke-width:2px
+    classDef data fill:#EFF6FF,stroke:#2563EB,color:#111827,stroke-width:2px
+    classDef model fill:#F5F3FF,stroke:#7C3AED,color:#111827,stroke-width:2px
+    classDef control fill:#FFF7ED,stroke:#EA580C,color:#111827,stroke-width:2px
+    linkStyle default stroke:#374151,stroke-width:2px

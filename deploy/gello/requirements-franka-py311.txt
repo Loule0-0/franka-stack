@@ -1,0 +1,17 @@
+# Audited minimal runtime for this repository's Linux x86_64 Franka path.
+# GELLO's broad upstream requirements.txt is intentionally not installed.
+docstring-parser==0.16
+evdev==1.7.1
+markdown-it-py==3.0.0
+mdurl==0.1.2
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+pygments==2.19.1
+pyrealsense2==2.56.5.9235
+pyserial==3.5
+pyzmq==26.4.0
+rich==14.0.0
+shtab==1.7.2
+typeguard==4.4.2
+typing-extensions==4.13.2
+tyro==0.9.22

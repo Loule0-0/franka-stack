@@ -1,0 +1,28 @@
+name: Test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.12"
+
+      - name: Install Python
+        run: uv python install 3.11
+
+      - name: Sync parent environment
+        run: uv sync --frozen --dev
+
+      - name: Run offline tests
+        run: uv run pytest -q
+
+      - name: Check shell syntax
+        run: bash -n scripts/franka/*.sh deploy/panda-polymetis/*.sh

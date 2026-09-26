@@ -1,0 +1,4 @@
+[submodule "third_party/openpi"]
+	path = third_party/openpi
+	url = https://github.com/Loule0-0/openpi-franka.git
+	branch = franka-stack

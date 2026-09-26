@@ -1,0 +1,4 @@
+*.sh text eol=lf
+*.patch text eol=lf -whitespace
+*.env text eol=lf
+*.env.example text eol=lf

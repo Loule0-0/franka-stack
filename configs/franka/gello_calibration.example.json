@@ -1,0 +1,12 @@
+{
+  "calibrated": false,
+  "robot_model": "franka_panda",
+  "gello_device_basename": "REQUIRED_FULL_DEV_SERIAL_BY_ID_BASENAME",
+  "joint_ids": [1, 2, 3, 4, 5, 6, 7],
+  "joint_offsets": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+  "joint_signs": [1, 1, 1, 1, 1, 1, 1],
+  "gripper_config": [8, 0.0, 1.0],
+  "start_joints": [0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0, 0.0],
+  "calibrated_at": null,
+  "notes": "Placeholder values only. Measure every offset, sign, gripper endpoint, and the safe start pose on this exact device before setting calibrated=true."
+}

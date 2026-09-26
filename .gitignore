@@ -1,0 +1,17 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Local data and training outputs.
+assets/
+checkpoints/
+data/
+datasets/
+state/
+wandb/

@@ -1,0 +1,693 @@
+diff --git a/polymetis/polymetis/include/polymetis/clients/franka_hand_client.hpp b/polymetis/polymetis/include/polymetis/clients/franka_hand_client.hpp
+index 6ac3089..535b22f 100644
+--- a/polymetis/polymetis/include/polymetis/clients/franka_hand_client.hpp
++++ b/polymetis/polymetis/include/polymetis/clients/franka_hand_client.hpp
+@@ -1,5 +1,8 @@
+ #include "spdlog/spdlog.h"
+ #include "yaml-cpp/yaml.h"
++#include <atomic>
++#include <cstdint>
++#include <thread>
+ 
+ #include "polymetis/utils.h"
+ #include <grpcpp/grpcpp.h>
+@@ -16,7 +19,8 @@
+ class FrankaHandClient {
+ private:
+   void getGripperState(void);
+-  void applyGripperCommand(void);
++  void applyGripperCommand(GripperCommand command);
++  void joinCompletedMotion(void);
+ 
+   // gRPC
+   std::unique_ptr<GripperServer::Stub> stub_;
+@@ -24,14 +28,16 @@ private:
+ 
+   GripperState gripper_state_;
+   GripperCommand gripper_cmd_;
+-  int prev_cmd_timestamp_ns_;
+-  bool prev_cmd_successful_ = true;
++  int64_t prev_cmd_timestamp_ns_ = 0;
++  std::atomic<bool> prev_cmd_successful_{true};
+ 
+   // Franka
+   std::shared_ptr<franka::Gripper> gripper_;
+-  bool is_moving_;
++  std::atomic<bool> is_moving_{false};
++  std::thread motion_thread_;
+ 
+ public:
+   FrankaHandClient(std::shared_ptr<grpc::Channel> channel, YAML::Node config);
+-  void run(void);
++  ~FrankaHandClient() noexcept;
++  int run(void);
+ };
+diff --git a/polymetis/polymetis/include/polymetis/clients/franka_panda_client.hpp b/polymetis/polymetis/include/polymetis/clients/franka_panda_client.hpp
+index c5a0f88..846979a 100644
+--- a/polymetis/polymetis/include/polymetis/clients/franka_panda_client.hpp
++++ b/polymetis/polymetis/include/polymetis/clients/franka_panda_client.hpp
+@@ -21,8 +21,6 @@
+ #define NUM_DOFS 7
+ #define FRANKA_HZ 1000.0
+ #define M_PI 3.14159265358979323846
+-#define RECOVERY_WAIT_SECS 1
+-#define RECOVERY_MAX_TRIES 3
+ 
+ class FrankaTorqueControlClient {
+ private:
+@@ -77,5 +75,5 @@ public:
+   */
+   FrankaTorqueControlClient(std::shared_ptr<grpc::Channel> channel,
+                             YAML::Node config);
+-  void run();
++  int run();
+ };
+diff --git a/polymetis/polymetis/include/real_time.hpp b/polymetis/polymetis/include/real_time.hpp
+index d7166c0..d5dc640 100644
+--- a/polymetis/polymetis/include/real_time.hpp
++++ b/polymetis/polymetis/include/real_time.hpp
+@@ -11,6 +11,7 @@
+ #ifndef REAL_TIME_H
+ #define REAL_TIME_H
+ 
++#include <cstdint>
+ #include <limits.h>
+ #include <malloc.h>
+ #include <pthread.h>
+@@ -43,6 +44,7 @@ int create_real_time_thread(void *(*start_routine)(void *), void *arg = NULL) {
+   struct sched_param param;
+   pthread_attr_t attr;
+   pthread_t thread;
++  void *thread_result = nullptr;
+   int ret;
+ 
+   int stack_size_mb = 20;
+@@ -71,10 +73,15 @@ int create_real_time_thread(void *(*start_routine)(void *), void *arg = NULL) {
+   }
+   printf("Disabled mmap...\n");
+ 
+-  write_cpu_dma_latency(cpu_dma_latency);
++  ret = write_cpu_dma_latency(cpu_dma_latency);
++  if (ret) {
++    printf("failed to configure cpu_dma_latency\n");
++    goto out;
++  }
+ 
+   /* Lock memory */
+-  if (mlockall(MCL_CURRENT | MCL_FUTURE)) {
++  ret = mlockall(MCL_CURRENT | MCL_FUTURE);
++  if (ret) {
+     printf("mlockall failed: %m\n");
+     goto out;
+   }
+@@ -127,16 +134,27 @@ int create_real_time_thread(void *(*start_routine)(void *), void *arg = NULL) {
+   printf("Started realtime thread.\n");
+ 
+   /* Join the thread and wait until it is done */
+-  ret = pthread_join(thread, NULL);
+-  if (ret)
++  ret = pthread_join(thread, &thread_result);
++  if (ret) {
+     printf("join pthread failed: %m\n");
++  } else {
++    const std::intptr_t control_status =
++        reinterpret_cast<std::intptr_t>(thread_result);
++    if (control_status != 0) {
++      fprintf(stderr,
++              "fatal: realtime control routine failed with status %ld.\n",
++              static_cast<long>(control_status));
++      ret = static_cast<int>(control_status);
++    }
++  }
+ 
+ out:
+   if (ret) {
+-    printf("starting thread in non-realtime.\n");
+-    start_routine(arg);
++    fprintf(stderr,
++            "fatal: realtime setup or control failed; refusing to continue "
++            "robot operation.\n");
+   }
+   return ret;
+ }
+ 
+-#endif
+\ No newline at end of file
++#endif
+diff --git a/polymetis/polymetis/protos/polymetis.proto b/polymetis/polymetis/protos/polymetis.proto
+index 5f0ce68..e99d7e6 100644
+--- a/polymetis/polymetis/protos/polymetis.proto
++++ b/polymetis/polymetis/protos/polymetis.proto
+@@ -62,6 +62,8 @@ service GripperServer {
+ 
+     rpc GetState(Empty) returns(GripperState) {}
+     rpc Goto(GripperCommand) returns(Empty) {}
++    // Queue a stop command independently of any in-flight Goto RPC.
++    rpc Stop(GripperCommand) returns(Empty) {}
+ 
+     rpc ControlUpdate(GripperState) returns(GripperCommand) {}
+ }
+@@ -80,6 +82,7 @@ message GripperCommand {
+     bool grasp = 5;
+     float epsilon_inner = 6;
+     float epsilon_outer = 7;
++    bool stop = 8;
+ }
+ 
+ message GripperState {
+diff --git a/polymetis/polymetis/python/polymetis/gripper_interface.py b/polymetis/polymetis/python/polymetis/gripper_interface.py
+index 100229c..8bc819d 100644
+--- a/polymetis/polymetis/python/polymetis/gripper_interface.py
++++ b/polymetis/polymetis/python/polymetis/gripper_interface.py
+@@ -67,6 +67,16 @@ class GripperInterface:
+         """
+         return self.grpc_connection.GetState(EMPTY)
+ 
++    def stop(self) -> None:
++        """Request cancellation of the current move or grasp.
++
++        Stop deliberately bypasses the goto command queue so it can run while
++        another caller is waiting for a queued command RPC.
++        """
++        command = polymetis_pb2.GripperCommand(stop=True)
++        command.timestamp.GetCurrentTime()
++        self.grpc_connection.Stop(command)
++
+     def goto(self, width: float, speed: float, force: float, blocking: bool = True):
+         """Commands the gripper to a certain width
+         Args:
+diff --git a/polymetis/polymetis/python/polymetis/robot_servers/gripper_server.py b/polymetis/polymetis/python/polymetis/robot_servers/gripper_server.py
+index 78f0cce..fb45414 100644
+--- a/polymetis/polymetis/python/polymetis/robot_servers/gripper_server.py
++++ b/polymetis/polymetis/python/polymetis/robot_servers/gripper_server.py
+@@ -5,6 +5,7 @@
+ import time
+ from concurrent import futures
+ import json
++import threading
+ 
+ import grpc
+ 
+@@ -12,6 +13,10 @@ import polymetis_pb2
+ import polymetis_pb2_grpc
+ 
+ 
++def _command_timestamp_ns(command):
++    return command.timestamp.seconds * 1_000_000_000 + command.timestamp.nanos
++
++
+ class PolymetisGripperServer(polymetis_pb2_grpc.GripperServerServicer):
+     """gRPC server that exposes a gripper controls to the user client
+     Gripper connects as a second client
+@@ -21,6 +26,7 @@ class PolymetisGripperServer(polymetis_pb2_grpc.GripperServerServicer):
+         self.gripper_state_cache = polymetis_pb2.GripperState()
+         self.gripper_cmd_cache = polymetis_pb2.GripperCommand()
+         self.metadata = None
++        self._command_lock = threading.Lock()
+ 
+     def InitRobotClient(self, request, context):
+         self.metadata = request
+@@ -31,13 +37,36 @@ class PolymetisGripperServer(polymetis_pb2_grpc.GripperServerServicer):
+ 
+     def ControlUpdate(self, request, context):
+         self.gripper_state_cache = request
+-        return self.gripper_cmd_cache
++        with self._command_lock:
++            return self.gripper_cmd_cache
+ 
+     def GetState(self, request, context):
+         return self.gripper_state_cache
+ 
+     def Goto(self, request, context):
+-        self.gripper_cmd_cache = request
++        with self._command_lock:
++            # Goto and Stop share the trusted user client's clock domain.
++            # Reject a Goto timestamped before the cached Stop even if that
++            # older RPC arrives late, while allowing a genuinely newer command.
++            if _command_timestamp_ns(request) > _command_timestamp_ns(self.gripper_cmd_cache):
++                self.gripper_cmd_cache = request
++        return polymetis_pb2.Empty()
++
++    def Stop(self, request, context):
++        with self._command_lock:
++            # Goto and Stop timestamps originate in the same trusted user
++            # client clock domain. Accept Stop unconditionally and advance it
++            # beyond both the request and cached command so an older in-flight
++            # Goto cannot overwrite it.
++            timestamp_ns = max(
++                _command_timestamp_ns(request),
++                _command_timestamp_ns(self.gripper_cmd_cache) + 1,
++            )
++            seconds, nanos = divmod(timestamp_ns, 1_000_000_000)
++            command = polymetis_pb2.GripperCommand(stop=True)
++            command.timestamp.seconds = seconds
++            command.timestamp.nanos = nanos
++            self.gripper_cmd_cache = command
+         return polymetis_pb2.Empty()
+ 
+ 
+diff --git a/polymetis/polymetis/src/clients/franka_panda_client/franka_hand_client.cpp b/polymetis/polymetis/src/clients/franka_panda_client/franka_hand_client.cpp
+index 41e3486..559de1f 100644
+--- a/polymetis/polymetis/src/clients/franka_panda_client/franka_hand_client.cpp
++++ b/polymetis/polymetis/src/clients/franka_panda_client/franka_hand_client.cpp
+@@ -1,9 +1,12 @@
+ #include "polymetis/clients/franka_hand_client.hpp"
+ 
+ #include "spdlog/spdlog.h"
++#include <cstdint>
++#include <exception>
+ #include <string>
+ #include <thread>
+ #include <time.h>
++#include <utility>
+ 
+ #include <grpc/grpc.h>
+ 
+@@ -20,10 +23,10 @@ FrankaHandClient::FrankaHandClient(std::shared_ptr<grpc::Channel> channel,
+   spdlog::info("Connecting to robot_ip {}", robot_ip);
+   gripper_.reset(new franka::Gripper(robot_ip));
+ 
+-  // Initialize gripper
+-  gripper_->homing();
+-  is_moving_ = false;
+-
++  // Homing is deliberately not automatic. It must be initiated by the operator
++  // as a separate, observed action before commands that require a homed gripper.
++  spdlog::warn(
++      "Automatic gripper homing is disabled; home manually before use.");
+   // Initialize server connection
+   franka::GripperState franka_gripper_state = gripper_->readOnce();
+ 
+@@ -38,73 +41,142 @@ FrankaHandClient::FrankaHandClient(std::shared_ptr<grpc::Channel> channel,
+   spdlog::info("Connected.", robot_ip);
+ }
+ 
++FrankaHandClient::~FrankaHandClient() noexcept {
++  if (!motion_thread_.joinable()) {
++    return;
++  }
++  if (is_moving_.load(std::memory_order_acquire)) {
++    try {
++      gripper_->stop();
++    } catch (const std::exception &ex) {
++      spdlog::error("Failed to stop gripper during shutdown: {}", ex.what());
++    }
++  }
++  motion_thread_.join();
++}
++
+ void FrankaHandClient::getGripperState(void) {
+   franka::GripperState franka_gripper_state = gripper_->readOnce();
+ 
+   gripper_state_.set_width(franka_gripper_state.width);
+   gripper_state_.set_is_grasped(franka_gripper_state.is_grasped);
+-  gripper_state_.set_is_moving(is_moving_);
+-  gripper_state_.set_prev_command_successful(prev_cmd_successful_);
++  gripper_state_.set_is_moving(is_moving_.load(std::memory_order_acquire));
++  gripper_state_.set_prev_command_successful(
++      prev_cmd_successful_.load(std::memory_order_acquire));
+ 
+   // gripper_state.time();  // Use current timestamp instead!
+   setTimestampToNow(gripper_state_.mutable_timestamp());
+ }
+ 
+-void FrankaHandClient::applyGripperCommand(void) {
+-  is_moving_ = true;
+-
+-  if (gripper_cmd_.grasp()) {
+-    spdlog::info("Grasping at width {} at speed={}", gripper_cmd_.width(),
+-                 gripper_cmd_.speed());
+-    double eps_inner = (gripper_cmd_.epsilon_inner() < 0)
++void FrankaHandClient::applyGripperCommand(GripperCommand command) {
++  bool successful = false;
++  try {
++    if (command.grasp()) {
++      spdlog::info("Grasping at width {} at speed={}", command.width(),
++                   command.speed());
++      double eps_inner = (command.epsilon_inner() < 0)
+                            ? EPSILON_INNER
+-                           : gripper_cmd_.epsilon_inner();
+-    double eps_outer = (gripper_cmd_.epsilon_outer() < 0)
++                           : command.epsilon_inner();
++      double eps_outer = (command.epsilon_outer() < 0)
+                            ? EPSILON_OUTER
+-                           : gripper_cmd_.epsilon_outer();
+-    prev_cmd_successful_ =
+-        gripper_->grasp(gripper_cmd_.width(), gripper_cmd_.speed(),
+-                        gripper_cmd_.force(), eps_inner, eps_outer);
+-
+-  } else {
+-    spdlog::info("Moving to width {} at speed={}", gripper_cmd_.width(),
+-                 gripper_cmd_.speed());
+-    prev_cmd_successful_ =
+-        gripper_->move(gripper_cmd_.width(), gripper_cmd_.speed());
++                           : command.epsilon_outer();
++      successful = gripper_->grasp(command.width(), command.speed(),
++                                   command.force(), eps_inner, eps_outer);
++    } else {
++      spdlog::info("Moving to width {} at speed={}", command.width(),
++                   command.speed());
++      successful = gripper_->move(command.width(), command.speed());
++    }
++  } catch (const std::exception &ex) {
++    spdlog::error("Gripper motion failed: {}", ex.what());
+   }
+ 
+-  is_moving_ = false;
++  prev_cmd_successful_.store(successful, std::memory_order_release);
++  is_moving_.store(false, std::memory_order_release);
++}
++
++void FrankaHandClient::joinCompletedMotion(void) {
++  if (motion_thread_.joinable() &&
++      !is_moving_.load(std::memory_order_acquire)) {
++    motion_thread_.join();
++  }
+ }
+ 
+-void FrankaHandClient::run(void) {
+-  int period = 1.0 / GRIPPER_HZ;
+-  int period_ns = period * 1.0e9;
++int FrankaHandClient::run(void) {
++  const long period_ns = 1000000000L / GRIPPER_HZ;
+ 
+-  int timestamp_ns;
++  int64_t timestamp_ns;
+ 
+   struct timespec abs_target_time;
+-  clock_gettime(CLOCK_REALTIME, &abs_target_time);
++  clock_gettime(CLOCK_MONOTONIC, &abs_target_time);
+   while (true) {
++    joinCompletedMotion();
++
+     // Run control step
+     getGripperState();
+ 
+     grpc::ClientContext context;
+     status_ = stub_->ControlUpdate(&context, gripper_state_, &gripper_cmd_);
++    if (!status_.ok()) {
++      spdlog::critical("Gripper ControlUpdate failed: {} (code {}). Stopping "
++                       "the Hand and refusing stale commands.",
++                       status_.error_message(),
++                       static_cast<int>(status_.error_code()));
++      bool stop_successful = false;
++      try {
++        stop_successful = gripper_->stop();
++      } catch (const std::exception &ex) {
++        spdlog::critical("Fail-closed gripper stop threw: {}", ex.what());
++      }
++      if (!stop_successful) {
++        spdlog::critical("Fail-closed gripper stop was not acknowledged.");
++      }
++      prev_cmd_successful_.store(false, std::memory_order_release);
++      return 1;
++    }
+ 
+-    if (!is_moving_) {
+-      // Skip if command not updated
+-      timestamp_ns = gripper_cmd_.timestamp().nanos();
+-      if (timestamp_ns != prev_cmd_timestamp_ns_ && timestamp_ns) {
+-        // applyGripperCommand() in separate thread
+-        std::thread th(&FrankaHandClient::applyGripperCommand, this);
+-        th.detach();
++    // The Hand's move/grasp calls block. Keep polling while a joinable worker
++    // owns that operation so a Stop command can call the thread-safe
++    // libfranka Gripper::stop() from this thread.
++    timestamp_ns = gripper_cmd_.timestamp().seconds() * 1000000000LL +
++                   gripper_cmd_.timestamp().nanos();
++    if (timestamp_ns != prev_cmd_timestamp_ns_ && timestamp_ns) {
++      if (gripper_cmd_.stop()) {
+         prev_cmd_timestamp_ns_ = timestamp_ns;
++        bool stop_successful = false;
++        try {
++          stop_successful = gripper_->stop();
++        } catch (const std::exception &ex) {
++          spdlog::error("Gripper stop failed: {}", ex.what());
++        }
++        prev_cmd_successful_.store(stop_successful,
++                                   std::memory_order_release);
++        // Do not join here: a failed or delayed stop must not block polling.
++        // The motion worker owns is_moving_ and joinCompletedMotion() reaps it
++        // only after move/grasp actually returns, allowing a newer Stop command
++        // (including the Python compensation Stop) to be processed meanwhile.
++      } else if (!is_moving_.load(std::memory_order_acquire)) {
++        joinCompletedMotion();
++        GripperCommand command = gripper_cmd_;
++        prev_cmd_timestamp_ns_ = timestamp_ns;
++        is_moving_.store(true, std::memory_order_release);
++        try {
++          motion_thread_ = std::thread(&FrankaHandClient::applyGripperCommand,
++                                       this, std::move(command));
++        } catch (...) {
++          is_moving_.store(false, std::memory_order_release);
++          throw;
++        }
+       }
+     }
+ 
+     // Spin once
+     abs_target_time.tv_nsec += period_ns;
+-    clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &abs_target_time, nullptr);
++    if (abs_target_time.tv_nsec >= 1000000000L) {
++      abs_target_time.tv_sec += abs_target_time.tv_nsec / 1000000000L;
++      abs_target_time.tv_nsec %= 1000000000L;
++    }
++    clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &abs_target_time, nullptr);
+   }
+ }
+ 
+@@ -113,18 +185,25 @@ int main(int argc, char *argv[]) {
+     spdlog::error("Usage: franka_hand_client /path/to/cfg.yaml");
+     return 1;
+   }
+-  YAML::Node config = YAML::LoadFile(argv[1]);
+-
+-  // Launch client
+-  std::string control_address = config["control_ip"].as<std::string>() + ":" +
+-                                config["control_port"].as<std::string>();
+-  FrankaHandClient franka_hand_client(
+-      grpc::CreateChannel(control_address, grpc::InsecureChannelCredentials()),
+-      config);
+-  franka_hand_client.run();
+-
+-  // Termination
+-  spdlog::info("Wait for shutdown; press CTRL+C to close.");
+-
+-  return 0;
++  try {
++    YAML::Node config = YAML::LoadFile(argv[1]);
++
++    // Keep the client automatic inside the try scope: if readOnce(), gRPC, or
++    // another runtime operation throws, stack unwinding runs its stop-and-join
++    // destructor before main reports failure.
++    std::string control_address =
++        config["control_ip"].as<std::string>() + ":" +
++        config["control_port"].as<std::string>();
++    FrankaHandClient franka_hand_client(
++        grpc::CreateChannel(control_address,
++                            grpc::InsecureChannelCredentials()),
++        config);
++    return franka_hand_client.run();
++  } catch (const std::exception &ex) {
++    spdlog::critical("Franka Hand client failed closed: {}", ex.what());
++    return 1;
++  } catch (...) {
++    spdlog::critical("Franka Hand client failed closed with an unknown error.");
++    return 1;
++  }
+ }
+diff --git a/polymetis/polymetis/src/clients/franka_panda_client/franka_panda_client.cpp b/polymetis/polymetis/src/clients/franka_panda_client/franka_panda_client.cpp
+index 60bd319..6ec03e6 100644
+--- a/polymetis/polymetis/src/clients/franka_panda_client/franka_panda_client.cpp
++++ b/polymetis/polymetis/src/clients/franka_panda_client/franka_panda_client.cpp
+@@ -8,6 +8,7 @@
+ #include "spdlog/spdlog.h"
+ #include "yaml-cpp/yaml.h"
+ #include <Eigen/Dense>
++#include <cstdint>
+ #include <math.h>
+ #include <stdexcept>
+ #include <string>
+@@ -126,7 +127,7 @@ FrankaTorqueControlClient::FrankaTorqueControlClient(
+   }
+ }
+ 
+-void FrankaTorqueControlClient::run() {
++int FrankaTorqueControlClient::run() {
+   // Create callback function that relays information between gRPC server and
+   // robot
+   auto control_callback = [&](const franka::RobotState &libfranka_robot_state,
+@@ -152,38 +153,14 @@ void FrankaTorqueControlClient::run() {
+ 
+   // Run robot
+   if (!mock_franka_ && !readonly_mode_) {
+-    bool is_robot_operational = true;
+-    while (is_robot_operational) {
+-      // Send lambda function
+-      try {
+-        robot_ptr_->control(control_callback, limit_rate_, lpf_cutoff_freq_);
+-      } catch (const std::exception &ex) {
+-        spdlog::error("Robot is unable to be controlled: {}", ex.what());
+-        is_robot_operational = false;
+-      }
+-
+-      // Automatic recovery
+-      spdlog::warn("Performing automatic error recovery. This calls "
+-                   "franka::Robot::automaticErrorRecovery, which is equivalent "
+-                   "to pressing and releasing the external activation device.");
+-      for (int i = 0; i < RECOVERY_MAX_TRIES; i++) {
+-        spdlog::warn("Automatic error recovery attempt {}/{}...", i + 1,
+-                     RECOVERY_MAX_TRIES);
+-
+-        // Wait
+-        usleep(1000000 * RECOVERY_WAIT_SECS);
+-
+-        // Attempt recovery
+-        try {
+-          robot_ptr_->automaticErrorRecovery();
+-          spdlog::warn("Robot operation recovered.");
+-          is_robot_operational = true;
+-          break;
+-
+-        } catch (const std::exception &ex) {
+-          spdlog::error("Recovery failed: {}", ex.what());
+-        }
+-      }
++    try {
++      robot_ptr_->control(control_callback, limit_rate_, lpf_cutoff_freq_);
++    } catch (const std::exception &ex) {
++      spdlog::error("Robot control stopped: {}", ex.what());
++      spdlog::error(
++          "Automatic error recovery is disabled. Inspect the fault and recover "
++          "manually before restarting the client.");
++      return 1;
+     }
+ 
+   } else {
+@@ -191,14 +168,11 @@ void FrankaTorqueControlClient::run() {
+     franka::RobotState robot_state;
+     franka::Duration duration;
+ 
+-    int period = 1.0 / FRANKA_HZ;
+-    int period_ns = period * 1.0e9;
++    const long period_ns = static_cast<long>(1.0e9 / FRANKA_HZ);
+ 
+     struct timespec abs_target_time;
++    clock_gettime(CLOCK_MONOTONIC, &abs_target_time);
+     while (true) {
+-      clock_gettime(CLOCK_REALTIME, &abs_target_time);
+-      abs_target_time.tv_nsec += period_ns;
+-
+       // Pull data from robot if in readonly mode
+       if (readonly_mode_) {
+         robot_state = robot_ptr_->readOnce();
+@@ -208,9 +182,17 @@ void FrankaTorqueControlClient::run() {
+       // in readonly mode)
+       control_callback(robot_state, duration);
+ 
+-      clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &abs_target_time, nullptr);
++      abs_target_time.tv_nsec += period_ns;
++      if (abs_target_time.tv_nsec >= 1000000000L) {
++        abs_target_time.tv_sec += abs_target_time.tv_nsec / 1000000000L;
++        abs_target_time.tv_nsec %= 1000000000L;
++      }
++      clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &abs_target_time,
++                      nullptr);
+     }
+   }
++
++  return 0;
+ }
+ 
+ void FrankaTorqueControlClient::updateServerCommand(
+@@ -435,9 +417,8 @@ void *rt_main(void *cfg_ptr) {
+   FrankaTorqueControlClient franka_panda_client(
+       grpc::CreateChannel(control_address, grpc::InsecureChannelCredentials()),
+       config);
+-  franka_panda_client.run();
+-
+-  return NULL;
++  return reinterpret_cast<void *>(
++      static_cast<std::intptr_t>(franka_panda_client.run()));
+ }
+ 
+ int main(int argc, char *argv[]) {
+@@ -449,7 +430,12 @@ int main(int argc, char *argv[]) {
+   void *config_void_ptr = static_cast<void *>(&config);
+ 
+   // Launch thread
+-  create_real_time_thread(rt_main, config_void_ptr);
++  int realtime_status = create_real_time_thread(rt_main, config_void_ptr);
++  if (realtime_status != 0) {
++    spdlog::critical("Realtime control thread failed with status {}. Exiting.",
++                     realtime_status);
++    return realtime_status;
++  }
+ 
+   // Termination
+   spdlog::info("Wait for shutdown; press CTRL+C to close.");
+diff --git a/polymetis/polymetis/tests/python/polymetis/test_gripper_interface.py b/polymetis/polymetis/tests/python/polymetis/test_gripper_interface.py
+index 52f0a2b..58f90ab 100644
+--- a/polymetis/polymetis/tests/python/polymetis/test_gripper_interface.py
++++ b/polymetis/polymetis/tests/python/polymetis/test_gripper_interface.py
+@@ -6,6 +6,7 @@ import pytest
+ from unittest.mock import MagicMock
+ 
+ from polymetis import GripperInterface
++from polymetis.robot_servers.gripper_server import PolymetisGripperServer
+ import polymetis_pb2
+ 
+ 
+@@ -29,10 +30,15 @@ def test_gripper_interface(mocked_gripper, blocking):
+     time.sleep(0.1)
+     mocked_gripper.grasp(speed=speed, force=force, blocking=blocking)
+     time.sleep(0.1)
++    mocked_gripper.stop()
+ 
+     # Check asserts
+     assert mocked_gripper.grpc_connection.GetState.call_count == 1
+     assert mocked_gripper.grpc_connection.Goto.call_count == 2
++    assert mocked_gripper.grpc_connection.Stop.call_count == 1
++    stop_command = mocked_gripper.grpc_connection.Stop.call_args.args[0]
++    assert stop_command.stop
++    assert stop_command.timestamp.seconds or stop_command.timestamp.nanos
+ 
+ 
+ @pytest.mark.parametrize("blocking", [True, False])
+@@ -51,3 +57,36 @@ def test_async_gripper_commands(mocked_gripper, blocking):
+     np.allclose(last_cmd.args[0].width, width)
+     np.allclose(last_cmd.args[0].speed, speed)
+     np.allclose(last_cmd.args[0].force, force)
++
++
++def test_stop_replaces_cached_goto_command():
++    server = PolymetisGripperServer()
++    goto = polymetis_pb2.GripperCommand(width=0.04, speed=0.05, force=10.0)
++    goto.timestamp.seconds = 100
++    server.Goto(goto, None)
++
++    # Stop is accepted even if the trusted client's clock moved backwards.
++    # The server normalizes the cached Stop just beyond the prior command,
++    # without mixing in its own wall clock.
++    stop = polymetis_pb2.GripperCommand(stop=True)
++    stop.timestamp.seconds = 99
++    server.Stop(stop, None)
++    command = server.ControlUpdate(polymetis_pb2.GripperState(), None)
++
++    assert command.stop
++    assert command.timestamp.seconds == 100
++    assert command.timestamp.nanos == 1
++
++    # A Goto already timestamped before Stop cannot overwrite the stop cache
++    # if its RPC arrives late.
++    server.Goto(goto, None)
++    assert server.ControlUpdate(polymetis_pb2.GripperState(), None).stop
++
++    # A genuinely later command remains usable (for example after a new user
++    # process explicitly starts a new session).
++    later = polymetis_pb2.GripperCommand(width=0.06, speed=0.05, force=10.0)
++    later.timestamp.seconds = command.timestamp.seconds + 1
++    server.Goto(later, None)
++    current = server.ControlUpdate(polymetis_pb2.GripperState(), None)
++    assert not current.stop
++    assert current.width == pytest.approx(0.06)

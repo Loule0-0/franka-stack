@@ -1,0 +1,44 @@
+[project]
+name = "franka-stack"
+version = "0.1.0"
+description = "End-to-end data, policy, and guarded deployment tooling for real Franka robots."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "franka-runtime",
+    "numpy>=1.22.4,<2",
+    "pillow>=11.0.0",
+    "pyzmq==25.1.2",
+]
+
+[project.urls]
+Repository = "https://github.com/Loule0-0/franka-stack"
+Documentation = "https://github.com/Loule0-0/franka-stack/tree/main/docs/franka"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8.6",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+franka-runtime = { workspace = true }
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["packages/franka-runtime/tests", "examples/franka_real"]
+pythonpath = ["packages/franka-runtime/src", "."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["third_party"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
